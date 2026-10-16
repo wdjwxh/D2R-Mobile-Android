@@ -180,6 +180,7 @@ static void draw_compute_report_record_locked(VkCommandBuffer cmd,uint64_t seria
 #include "vk_compute.inc"
 #include "vk_graphics_catalog.inc"
 #include "vk_draw.inc"
+#include "vk_shader_prepare.inc"
 #include "vk_sync_tickets.inc"
 #include "vk_present_pixels.inc"
 #include "vk_present_ring.inc"

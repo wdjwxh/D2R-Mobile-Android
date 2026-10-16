@@ -65,6 +65,8 @@ sh android-host/build_apk.sh
 
 输出为 `android-host/apk-out/d2rm-research.apk`。**这个文件含本机生成的游戏衍生内容，不是可公开上传的源码仓库产物。** 本机 `debug.keystore` 会自动生成，不要共享，也不要每次更新随意替换；签名不同将无法直接覆盖旧应用。
 
+为覆盖已经安装过的测试包，设置 `D2R_SIGNING_KEYSTORE` 为原调试 keystore 的本机路径；该文件不要复制进公开仓库。当前脚本使用 Android 标准调试签名参数，变量不用于处理商店发行密钥。包名维持 `local.d2rm`，预览包 versionCode 为 101，资源目录仍为 `Android/data/local.d2rm/files/romfs/data/`。
+
 只修改 native/Java、已经有正确的完整出包目录时可以：
 
 ```bash

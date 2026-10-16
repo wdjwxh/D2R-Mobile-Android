@@ -3,6 +3,7 @@
 #include <jni.h>
 #include <android/native_window_jni.h>
 #include "display.h"
+#include "vk_backend.h"
 #include <sys/mman.h>
 #include <unistd.h>
 void dm_log_str(const char *s);
@@ -182,6 +183,39 @@ static int dmhost_load_and_run(const char *tables, const char *mainbin, const ch
     LOG("Guest modules loaded; booting on the dedicated 32 MB stack");
     boot_on_big_stack();
     return 0;
+}
+
+// prepare is synchronous on the Java worker; callbacks finish before it returns.
+// The JNI invocation retains the Activity for this call. Java ignores callbacks
+// after destruction, and never starts the guest until its surface is ready again.
+typedef struct {JNIEnv *env;jobject activity;jmethodID progress;int failed;} shader_prepare_ui;
+static void shader_prepare_progress(void *opaque,unsigned done,unsigned total,const char *phase) {
+    shader_prepare_ui *ui=opaque;if(ui->failed)return;
+    JNIEnv *env=ui->env;
+    jstring message=(*env)->NewStringUTF(env,phase?phase:"");
+    if(message) {
+        (*env)->CallVoidMethod(env,ui->activity,ui->progress,(jint)done,(jint)total,message);
+        (*env)->DeleteLocalRef(env,message);
+    }
+    if((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);ui->failed=1;
+    }
+}
+JNIEXPORT jint JNICALL
+Java_local_d2rm_MainActivity_nativePrepareShaders(JNIEnv *env,jobject activity,jstring jRoot,jstring jManifest) {
+    if(!jRoot || !jManifest)return -1;
+    jclass cls=(*env)->GetObjectClass(env,activity);if(!cls)return -1;
+    jmethodID method=(*env)->GetMethodID(env,cls,"onShaderPrepareProgress","(IILjava/lang/String;)V");
+    (*env)->DeleteLocalRef(env,cls);if(!method)return -1;
+    const char *root=(*env)->GetStringUTFChars(env,jRoot,NULL);if(!root)return -1;
+    const char *manifest=(*env)->GetStringUTFChars(env,jManifest,NULL);
+    if(!manifest){(*env)->ReleaseStringUTFChars(env,jRoot,root);return -1;}
+    setenv("DM_ROOT",root,1);
+    shader_prepare_ui ui={env,activity,method,0};
+    int result=dm_vk_prepare_shaders(root,manifest,shader_prepare_progress,&ui);
+    (*env)->ReleaseStringUTFChars(env,jManifest,manifest);
+    (*env)->ReleaseStringUTFChars(env,jRoot,root);
+    return ui.failed?-1:result;
 }
 
 JNIEXPORT jint JNICALL

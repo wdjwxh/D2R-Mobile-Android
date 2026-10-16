@@ -38,7 +38,7 @@ cp jniLibs/arm64-v8a/libdmhost.so lib/arm64-v8a/
 echo '== 6. 对齐 + 签名 =='
 python "$ROOT/android-host/normalize_apk_paths.py" "$OUT/base.apk"
 "$BT/zipalign.exe" -f 4 base.apk aligned.apk
-KS=$ROOT/android-host/debug.keystore
+KS=${D2R_SIGNING_KEYSTORE:-$ROOT/android-host/debug.keystore}
 [ -f "$KS" ] || "$KEYTOOL" -genkeypair -keystore "$KS" -storepass android -keypass android \
     -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
 cmd //c "$(cygpath -w "$BT/apksigner.bat")" sign --ks "$KS" --ks-pass pass:android --out d2rm-research.apk aligned.apk

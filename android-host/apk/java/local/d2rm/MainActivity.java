@@ -16,12 +16,170 @@ import java.io.OutputStream;
 
 public class MainActivity extends Activity {
     private static final AtomicBoolean started = new AtomicBoolean();
+    private static volatile boolean guestRunning;
     private static volatile java.lang.ref.WeakReference<MainActivity> active = new java.lang.ref.WeakReference<>(null);
     private android.app.AlertDialog keyboardDialog;
     private android.app.AlertDialog saveFailureDialog;
     private long touchButtons, keyButtons;
     private void publishButtons() { nativeButtons(touchButtons | keyButtons, false); }
     private PadView padView;
+    private LinearLayout preparePanel;
+    private ScrollView prepareScroll;
+    private android.widget.TextView prepareTitle, prepareText;
+    private android.widget.ProgressBar prepareBar;
+    private android.widget.Button prepareRetry, prepareImport, prepareContinue;
+    private final Object surfaceGate = new Object();
+    private volatile boolean surfaceReady, foreground, destroyed, gameEntered;
+    private boolean preparing, prepareFailed;
+    private volatile boolean allowLazy;
+    private String preparePhase = "正在检查启动资源";
+    private static final int IMPORT_SHADERS = 71;
+    private static final long MAX_SHADER_ARCHIVE = 1024L * 1024 * 1024;
+
+    private void setPreparing(boolean value) {
+        preparing=value;
+        if(foreground && (value || guestRunning))getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+    private void prepareUi(String title,String message,boolean failed) {
+        runOnUiThread(() -> {
+            if(destroyed || isFinishing())return;
+            prepareFailed=failed;
+            prepareScroll.setVisibility(android.view.View.VISIBLE);
+            prepareTitle.setText(title);prepareText.setText(message);
+            prepareBar.setIndeterminate(true);prepareBar.setVisibility(failed?android.view.View.GONE:android.view.View.VISIBLE);
+            prepareRetry.setVisibility(failed && !guestRunning?android.view.View.VISIBLE:android.view.View.GONE);
+            prepareImport.setVisibility(failed && !guestRunning?android.view.View.VISIBLE:android.view.View.GONE);
+            prepareContinue.setVisibility(android.view.View.GONE);
+            setPreparing(!failed);
+        });
+    }
+    private void onShaderPrepareProgress(int done,int total,String phase) {
+        preparePhase=phase==null?"正在准备 Vulkan 着色器":phase;
+        final String message=preparePhase;
+        runOnUiThread(() -> {
+            if(destroyed || isFinishing())return;
+            prepareTitle.setText("正在准备 Vulkan 着色器");
+            boolean known=total>0 && done>=0 && done<=total;
+            prepareBar.setIndeterminate(!known);
+            if(known){prepareBar.setMax(total);prepareBar.setProgress(done);}
+            prepareText.setText("预编译常用管线，其他变体首次使用时编译。\n"+message+(known?"\n"+done+" / "+total:""));
+        });
+    }
+    private boolean awaitSurface() throws InterruptedException {
+        synchronized(surfaceGate) {
+            while(!destroyed && (!surfaceReady || !foreground))surfaceGate.wait();
+            return !destroyed;
+        }
+    }
+    private void startWhenReady() {
+        if(destroyed || prepareFailed || !foreground || !surfaceReady || !started.compareAndSet(false,true))return;
+        prepareUi("准备启动","正在检查本机资源；首次 Vulkan 准备完成后会保存设备缓存。",false);
+        new Thread(() -> {
+            try {if(awaitSurface())run();}
+            catch(Exception e){log("准备失败："+e.getMessage());}
+            finally {
+                if(!gameEntered) {
+                    started.set(false);
+                    runOnUiThread(() -> {
+                        if(!destroyed)setPreparing(false);
+                        MainActivity current=active.get();
+                        if(destroyed && current!=null && current!=this)current.startWhenReady();
+                    });
+                }
+            }
+        },"dmhost").start();
+    }
+    private void chooseShaderArchive() {
+        if(started.get())return;
+        android.content.Intent intent=new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);intent.setType("*/*");
+        try {startActivityForResult(intent,IMPORT_SHADERS);}
+        catch(android.content.ActivityNotFoundException e){log("准备失败：系统没有文件选择器，请将档案放到指定 shaders 目录。");}
+    }
+    private void validateShaderArchive(File file) throws java.io.IOException {
+        if(file.length()<16 || file.length()>MAX_SHADER_ARCHIVE)throw new java.io.IOException("着色器档案大小无效（允许 16 字节至 1 GiB）："+file);
+        byte[] header=new byte[8];
+        try(InputStream in=new java.io.FileInputStream(file)) {
+            int offset=0,n;while(offset<header.length && (n=in.read(header,offset,header.length-offset))>0)offset+=n;
+            if(offset!=8 || !java.util.Arrays.equals(header,"D2RVKSH4".getBytes(java.nio.charset.StandardCharsets.US_ASCII)))
+                throw new java.io.IOException("需要兼容的 SH4 graphics.vkpack 档案；游戏 data 目录不能代替 Vulkan 着色器档案。");
+        }
+    }
+    private void copyAtomic(InputStream in,File target,boolean shader) throws java.io.IOException {
+        File parent=target.getParentFile();
+        if(!parent.isDirectory() && !parent.mkdirs())throw new java.io.IOException("无法建立目录："+parent);
+        File temporary=new File(parent,target.getName()+".importing");
+        try {
+            try(FileOutputStream out=new FileOutputStream(temporary)) {
+                byte[] bytes=new byte[65536];int n;long count=0;
+                while((n=in.read(bytes))!=-1) {
+                    count+=n;if(shader && count>MAX_SHADER_ARCHIVE)throw new java.io.IOException("着色器档案超过 1 GiB 限制");
+                    out.write(bytes,0,n);
+                }
+                out.getFD().sync();
+            }
+            if(shader)validateShaderArchive(temporary);
+            if(!temporary.renameTo(target))throw new java.io.IOException("无法替换文件："+target);
+        } finally {if(temporary.exists())temporary.delete();}
+    }
+    private boolean hasAsset(String name) throws java.io.IOException {
+        for(String entry:getAssets().list(""))if(entry.equals(name))return true;
+        return false;
+    }
+    private File prepareShaderFiles(File dir,File external,long version) throws java.io.IOException {
+        File catalog=new File(dir,"graphics.vkpack"),supplied=new File(external,"shaders/graphics.vkpack");
+        android.content.SharedPreferences prefs=getSharedPreferences("shader-assets",MODE_PRIVATE);
+        if(supplied.isFile()) {
+            validateShaderArchive(supplied);
+            String fingerprint=supplied.getAbsolutePath()+":"+supplied.length()+":"+supplied.lastModified();
+            if(!catalog.isFile() || !fingerprint.equals(prefs.getString("external-source","")) || catalog.length()!=supplied.length()) {
+                prepareUi("准备启动","正在导入本机 Vulkan 着色器档案…",false);
+                try(InputStream in=new java.io.FileInputStream(supplied)){copyAtomic(in,catalog,true);}
+                prefs.edit().putString("external-source",fingerprint).remove("apk-version").apply();
+            }
+        } else if(hasAsset("graphics.vkpack")) {
+            if(!catalog.isFile() || prefs.getLong("apk-version",-1)!=version) {
+                try(InputStream in=getAssets().open("graphics.vkpack")){copyAtomic(in,catalog,true);}
+                prefs.edit().putLong("apk-version",version).remove("external-source").apply();
+            }
+        } else if(!catalog.isFile()) {
+            throw new java.io.IOException("缺少 Vulkan 着色器档案。请点“选择着色器档案”导入 graphics.vkpack，或放到：\n"+supplied.getAbsolutePath()+"\n原有 romfs/data 无需移动，但不能直接代替此档案。");
+        }
+        validateShaderArchive(catalog);
+        File manifest=new File(dir,"pso_manifest.tsv");
+        if(!manifest.isFile() || prefs.getLong("manifest-version",-1)!=version) {
+            try(InputStream in=getAssets().open("pso_manifest.tsv")){copyAtomic(in,manifest,false);}
+            prefs.edit().putLong("manifest-version",version).apply();
+        }
+        return manifest;
+    }
+    @Override protected void onActivityResult(int request,int result,android.content.Intent data) {
+        super.onActivityResult(request,result,data);
+        if(request!=IMPORT_SHADERS || result!=RESULT_OK || data==null || data.getData()==null)return;
+        if(!started.compareAndSet(false,true))return;
+        prepareUi("正在导入","正在复制并检查本机着色器档案…",false);
+        final android.net.Uri uri=data.getData();
+        new Thread(() -> {
+            boolean imported=false;
+            try {
+                File external=getExternalFilesDir(null);if(external==null)throw new java.io.IOException("外部存储不可用");
+                try(InputStream in=getContentResolver().openInputStream(uri)) {
+                    if(in==null)throw new java.io.IOException("无法读取选择的文件");
+                    copyAtomic(in,new File(external,"shaders/graphics.vkpack"),true);
+                }
+                getSharedPreferences("shader-assets",MODE_PRIVATE).edit().remove("external-source").apply();
+                imported=true;
+            } catch(Exception e){log("导入失败："+e.getMessage());}
+            finally {
+                started.set(false);final boolean ok=imported;
+                runOnUiThread(() -> {
+                    if(!destroyed){setPreparing(false);if(ok){prepareFailed=false;startWhenReady();}}
+                    else {MainActivity current=active.get();if(current!=null && ok)current.startWhenReady();}
+                });
+            }
+        },"shader-import").start();
+    }
     // Geometry and gestures are owned by upstream dm_touch_controls.c.
     // This adapter translates Android pixels to UIKit-sized points and paints
     // DmTouchOverlay's shapes/assets without inventing a controller layout.
@@ -266,7 +424,6 @@ public class MainActivity extends Activity {
         active = new java.lang.ref.WeakReference<>(this);
         nativeSetLanguageTag(java.util.Locale.getDefault().toLanguageTag());
         nativeRegisterUi();
-        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         immersive();
         android.widget.FrameLayout root = new android.widget.FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
@@ -280,26 +437,37 @@ public class MainActivity extends Activity {
         root.addView(render,new android.widget.FrameLayout.LayoutParams(-1,-1,android.view.Gravity.CENTER));
         padView=new PadView();
         root.addView(padView,new android.widget.FrameLayout.LayoutParams(-1,-1,android.view.Gravity.CENTER));
+        preparePanel=new LinearLayout(this);preparePanel.setOrientation(LinearLayout.VERTICAL);
+        preparePanel.setGravity(android.view.Gravity.CENTER);preparePanel.setPadding(48,24,48,24);preparePanel.setBackgroundColor(0xff171411);
+        prepareTitle=new android.widget.TextView(this);prepareTitle.setTextColor(0xffead9b8);prepareTitle.setTextSize(24);
+        prepareText=new android.widget.TextView(this);prepareText.setTextColor(Color.WHITE);prepareText.setTextSize(16);prepareText.setGravity(android.view.Gravity.CENTER);
+        prepareBar=new android.widget.ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);prepareBar.setIndeterminate(true);
+        prepareRetry=new android.widget.Button(this);prepareRetry.setText("重试准备");prepareRetry.setOnClickListener(v -> {allowLazy=false;prepareFailed=false;startWhenReady();});
+        prepareImport=new android.widget.Button(this);prepareImport.setText("选择着色器档案");prepareImport.setOnClickListener(v -> chooseShaderArchive());
+        prepareContinue=new android.widget.Button(this);prepareContinue.setText("继续按需编译");prepareContinue.setOnClickListener(v -> {if(started.get())return;allowLazy=true;prepareFailed=false;startWhenReady();});
+        preparePanel.addView(prepareTitle);preparePanel.addView(prepareText,new LinearLayout.LayoutParams(-1,-2));
+        preparePanel.addView(prepareBar,new LinearLayout.LayoutParams(-1,-2));preparePanel.addView(prepareRetry);preparePanel.addView(prepareImport);
+        preparePanel.addView(prepareContinue);
+        prepareRetry.setVisibility(android.view.View.GONE);prepareImport.setVisibility(android.view.View.GONE);prepareContinue.setVisibility(android.view.View.GONE);
+        prepareScroll=new ScrollView(this);prepareScroll.setFillViewport(true);prepareScroll.setBackgroundColor(0xff171411);prepareScroll.addView(preparePanel);
+        root.addView(prepareScroll,new android.widget.FrameLayout.LayoutParams(-1,-1));
+        if(guestRunning)prepareScroll.setVisibility(android.view.View.GONE);
         setContentView(root);
         render.getHolder().addCallback(new SurfaceHolder.Callback() {
             public void surfaceCreated(SurfaceHolder holder) { }
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
                 nativeSetSurface(holder.getSurface());
-                if (started.compareAndSet(false, true)) {
-                    new Thread(() -> {
-                        try { run(); }
-                        catch (Exception e) { log("异常: " + e); }
-                    }, "dmhost").start();
-                }
+                synchronized(surfaceGate){surfaceReady=true;surfaceGate.notifyAll();}
+                startWhenReady();
             }
-            public void surfaceDestroyed(SurfaceHolder holder) { nativeSetSurface(null); }
+            public void surfaceDestroyed(SurfaceHolder holder) { synchronized(surfaceGate){surfaceReady=false;} nativeSetSurface(null); }
         });
     }
 
     private void log(final String s) {
         android.util.Log.i("dmhost", s);
         if(s.contains("失败") || s.startsWith("异常") || s.contains("不可用") || s.contains("无法") || s.startsWith("dmhost 返回"))
-            runOnUiThread(() -> new android.app.AlertDialog.Builder(this).setMessage(s).setPositiveButton(nativeUiText("dmConfirm"),null).show());
+            prepareUi("启动未完成",s,true);
     }
 
     private static final String[] ASSETS = {
@@ -308,7 +476,7 @@ public class MainActivity extends Activity {
         "main.gates.tsv", "sdk.gates.tsv",
     };
 
-    private void run() {
+    private void run() throws InterruptedException {
         File dir = getFilesDir();
         File external = getExternalFilesDir(null);
         if (external == null) { log("外部存储不可用，无法建立资源目录"); return; }
@@ -318,6 +486,7 @@ public class MainActivity extends Activity {
             return;
         }
         log("资源目录：" + romfs.getAbsolutePath());
+        File manifest;
         try {
             long version = getPackageManager().getPackageInfo(getPackageName(), 0).lastUpdateTime;
             // Same ctrl_touch/layout overlay shipped by the upstream iOS app.
@@ -339,18 +508,7 @@ public class MainActivity extends Activity {
                 }
                 overlayPrefs.edit().putLong("apk-version",version).apply();
             }
-            File catalog = new File(dir, "graphics.vkpack");
-            android.content.SharedPreferences prefs = getSharedPreferences("shader-assets", MODE_PRIVATE);
-            if (!catalog.isFile() || prefs.getLong("apk-version", -1) != version) {
-                File temporary = new File(dir, "graphics.vkpack.tmp");
-                try (InputStream in = getAssets().open("graphics.vkpack"); OutputStream out = new FileOutputStream(temporary)) {
-                    byte[] buffer = new byte[65536]; int count;
-                    while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
-                }
-                if (!temporary.renameTo(catalog)) throw new java.io.IOException("shader archive rename failed");
-                prefs.edit().putLong("apk-version", version).apply();
-                log("图形着色器资源就绪（管线按需编译）");
-            }
+            manifest=prepareShaderFiles(dir,external,version);
         } catch (Exception e) { log("着色器资源准备失败：" + e); return; }
         File stamp = new File(dir, ".v1");
         if (!stamp.exists()) {
@@ -371,6 +529,20 @@ public class MainActivity extends Activity {
             }
             try { stamp.createNewFile(); } catch (Exception ignored) {}
         }
+        if(!awaitSurface())return;
+        prepareUi("正在准备 Vulkan 着色器", "预编译常用管线，其他变体首次使用时编译。首次准备可能需要几分钟。", false);
+        int prepared=allowLazy?0:nativePrepareShaders(dir.getAbsolutePath(),manifest.getAbsolutePath());
+        if(prepared<0){log("着色器准备失败："+preparePhase+"\n请检查档案版本和可用空间，然后重试或重新导入。");return;}
+        if(prepared>0){
+            prepareUi("部分管线未完成",preparePhase+"\n可以重试，或继续游戏并在首次使用时按需编译。未完成的准备不会标记为成功。",true);
+            runOnUiThread(() -> {if(!destroyed)prepareContinue.setVisibility(android.view.View.VISIBLE);});
+            return;
+        }
+        synchronized(surfaceGate){
+            while(!destroyed && (!surfaceReady || !foreground))surfaceGate.wait();
+            if(destroyed)return;gameEntered=true;guestRunning=true;
+        }
+        runOnUiThread(() -> { if(!destroyed){setPreparing(false);prepareScroll.setVisibility(android.view.View.GONE);if(foreground)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);} });
         log("启动游戏，日志见 logcat 标签 dmhost");
         int r = nativeRun(dir.getAbsolutePath(),
                 new File(dir, "main.android.bin").getAbsolutePath(),
@@ -379,10 +551,12 @@ public class MainActivity extends Activity {
         log("dmhost 返回 " + r);
     }
 
-    @Override protected void onResume() { super.onResume(); nativeFocus(1); }
-    @Override protected void onPause() { if(padView!=null) padView.reset(); touchButtons = keyButtons = 0; nativeStick(0,0); nativeButtons(0, true); nativeFocus(2); super.onPause(); }
+    @Override protected void onResume() { super.onResume(); synchronized(surfaceGate){foreground=true;surfaceGate.notifyAll();} if(preparing || guestRunning)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); nativeFocus(1); startWhenReady(); }
+    @Override protected void onPause() { synchronized(surfaceGate){foreground=false;} getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); if(padView!=null) padView.reset(); touchButtons = keyButtons = 0; nativeStick(0,0); nativeButtons(0, true); nativeFocus(2); super.onPause(); }
     @Override protected void onStop() { nativeFocus(3); super.onStop(); }
     @Override protected void onDestroy() {
+        synchronized(surfaceGate){destroyed=true;surfaceGate.notifyAll();}
+        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (keyboardDialog != null) keyboardDialog.dismiss();
         if (active.get() == this) active.clear();
         super.onDestroy();
@@ -411,6 +585,7 @@ public class MainActivity extends Activity {
 
     private native void nativeSetSurface(Surface surface);
 
+    private native int nativePrepareShaders(String root,String manifest);
     private native int nativeRun(String tables, String mainbin, String sdkbin, String romfs);
 
     static {

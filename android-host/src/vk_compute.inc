@@ -1,10 +1,14 @@
 #include "vk_compute.h"
 #include "compute_catalog.inc"
 #include <time.h>
+#include <unistd.h>
+#include <zlib.h>
+static int prep_cache_saved(const void *data,size_t size);
 
 typedef struct { VkPipeline pipeline; VkPipelineLayout layout; VkDescriptorSetLayout set; } compute_pipeline;
 static compute_pipeline compute_pipelines[sizeof compute_catalog/sizeof *compute_catalog];
 static VkPipelineCache compute_cache;
+static int compute_cache_imported;
 static char compute_cache_path[1024];
 static void images_close_locked(void);
 static void graphics_image_cache_retire(VkImage image);
@@ -28,15 +32,20 @@ const dm_compute_shader *dm_vk_compute_lookup(const char *key) {
     for(unsigned i=0;i<sizeof compute_catalog/sizeof *compute_catalog;i++)if(!strcmp(compute_catalog[i].key,key))return &compute_catalog[i];
     return NULL;
 }
-static void compute_cache_save(void) {
-    if(!compute_cache || !compute_cache_path[0])return;
-    size_t size=0;if(vkGetPipelineCacheData(v.device,compute_cache,&size,NULL) || !size)return;
-    void *data=malloc(size);if(!data)return;
+static int compute_cache_save(void) {
+    if(!compute_cache || !compute_cache_path[0])return -1;
+    size_t size=0;if(vkGetPipelineCacheData(v.device,compute_cache,&size,NULL) || !size)return -1;
+    void *data=malloc(size);if(!data)return -1;
+    int result=-1;
     if(!vkGetPipelineCacheData(v.device,compute_cache,&size,data)) {
         char temp[1060];snprintf(temp,sizeof temp,"%s.tmp",compute_cache_path);
-        FILE *f=fopen(temp,"wb");if(f){int ok=fwrite(data,1,size,f)==size;if(fclose(f))ok=0;if(ok)rename(temp,compute_cache_path);}
+        FILE *f=fopen(temp,"wb");if(f){int ok=fwrite(data,1,size,f)==size;
+            if(ok && (fflush(f) || fsync(fileno(f))))ok=0;
+            if(fclose(f))ok=0;
+            if(ok && !rename(temp,compute_cache_path))result=prep_cache_saved(data,size);
+        }
     }
-    free(data);
+    free(data);return result;
 }
 static void compute_cache_checkpoint(void) {
     static time_t last;
@@ -62,6 +71,8 @@ static int compute_cache_open(void) {
     VkPipelineCacheCreateInfo ci={.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,.initialDataSize=size,.pInitialData=data};
     VkResult r=vkCreatePipelineCache(v.device,&ci,NULL,&compute_cache);
     if(r && data){ci.initialDataSize=0;ci.pInitialData=NULL;r=vkCreatePipelineCache(v.device,&ci,NULL,&compute_cache);}
+    uint32_t imported_header=0;if(ci.initialDataSize>=32)memcpy(&imported_header,data,4);
+    compute_cache_imported=!r && imported_header>=32 && ci.initialDataSize>imported_header;
     LOG("Vulkan compute cache: bytes=%zu result=%d",size,r);free(data);return r? -1:0;
 }
 static void compute_close_locked(void) {
@@ -77,7 +88,7 @@ static void compute_close_locked(void) {
     }
     memset(compute_pipelines,0,sizeof compute_pipelines);
     if(compute_cache)vkDestroyPipelineCache(v.device,compute_cache,NULL);
-    compute_cache=VK_NULL_HANDLE;compute_cache_path[0]=0;
+    compute_cache=VK_NULL_HANDLE;compute_cache_path[0]=0;compute_cache_imported=0;
 }
 static VkDescriptorType compute_binding_type(const dm_shader_binding *b) {
     if(b->kind==DM_BIND_INPUT_ATTACHMENT)return VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;

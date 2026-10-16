@@ -27,6 +27,7 @@ python "$ROOT/mk_guest_so.py" "$ROOT/android-work/modules/sdk.android.bin" "$ROO
 
 echo '== 2. 准备资产（模块映像 + 装载表）=='
 python "$ROOT/android-host/build_graphics.py" "$OUT/assets/graphics.vkpack"
+cp "$ROOT/d2r-mobile/dm/gfx/nvn/pso_manifest.tsv" "$OUT/assets/pso_manifest.tsv"
 cp "$ROOT/android-work/modules/main.android.bin" "$OUT/assets/"
 cp "$ROOT/android-work/modules/sdk.android.bin" "$OUT/assets/"
 for t in main.fixups.tsv sdk.fixups.tsv main.gates.tsv sdk.gates.tsv; do
@@ -64,7 +65,7 @@ cp jniLibs/arm64-v8a/*.so lib/arm64-v8a/
 echo '== 6. 对齐 + 签名 =='
 python "$ROOT/android-host/normalize_apk_paths.py" "$OUT/base.apk"
 "$BT/zipalign.exe" -f 4 base.apk aligned.apk
-KS=$ROOT/android-host/debug.keystore
+KS=${D2R_SIGNING_KEYSTORE:-$ROOT/android-host/debug.keystore}
 [ -f "$KS" ] || "$KEYTOOL" -genkeypair -keystore "$KS" -storepass android -keypass android \
     -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
 cmd //c "$(cygpath -w "$BT/apksigner.bat")" sign --ks "$KS" --ks-pass pass:android --out d2rm-research.apk aligned.apk

@@ -1032,6 +1032,53 @@ static int draw_clear_pass(const dm_draw *d,gpu_image *const targets[9],unsigned
     *begin_pass=pass;return 0;
 }
 #include "vk_draw_fuse.inc"
+/* Shared by guest draws and startup seed preparation. No resources or commands
+ * are submitted here; callers own modules, layouts and compatible render pass. */
+static int draw_pipeline_create(const dm_draw *d,VkRenderPass pass,VkPipelineLayout layout,
+        const VkShaderModule modules[2],VkPrimitiveTopology topology,
+        unsigned ns,const VkVertexInputBindingDescription *streams,
+        unsigned na,const VkVertexInputAttributeDescription *attrs,unsigned ncolor,VkPipeline *pipeline) {
+    const VkPhysicalDeviceFeatures features=v.features;
+    VkPipelineShaderStageCreateInfo stages[2]={
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=modules[0],.pName="main"},
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=modules[1],.pName="main"}};
+    VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,.vertexBindingDescriptionCount=ns,.pVertexBindingDescriptions=streams,.vertexAttributeDescriptionCount=na,.pVertexAttributeDescriptions=attrs};
+    VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=topology};
+    VkPipelineViewportStateCreateInfo vs={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.scissorCount=1};
+    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,
+        // Keep the upstream Metal/NVN winding. The negative-height viewport
+        // below supplies Metal's clip-space Y mapping for every shader/pass.
+        .cullMode=d->cull,.frontFace=d->front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE,.lineWidth=1,
+        .depthBiasEnable=d->depth_bias,.depthBiasConstantFactor=d->bias_units,.depthBiasSlopeFactor=d->bias_factor,.depthBiasClamp=d->bias_clamp};
+    VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT,.alphaToCoverageEnable=d->alpha_to_coverage};
+    if(d->depth_compare<1 || d->depth_compare>8)return -1;
+    VkPipelineDepthStencilStateCreateInfo depth={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable=d->depth_test,.depthWriteEnable=d->depth_write,.depthCompareOp=d->depth_compare-1,.stencilTestEnable=d->stencil_test};
+    for(int i=0;i<2;i++) {
+        const dm_stencil *s=&d->stencil[i];
+        if(s->fail<1 || s->fail>8 || s->zfail<1 || s->zfail>8 || s->zpass<1 || s->zpass>8 || s->compare<1 || s->compare>8)return -1;
+        VkStencilOpState state={s->fail-1,s->zpass-1,s->zfail-1,s->compare-1,s->compare_mask,s->write_mask,s->reference};
+        if(i)depth.back=state;else depth.front=state;
+    }
+    VkPipelineColorBlendAttachmentState blend[8]={0};
+    for(unsigned i=0;i<ncolor;i++) {
+        const dm_blend *b=&d->blend[i];blend[i].colorWriteMask=b->mask;blend[i].blendEnable=b->enabled;
+        if(b->enabled && !features.dualSrcBlend && ((b->src_rgb>=16 && b->src_rgb<=19) || (b->dst_rgb>=16 && b->dst_rgb<=19) || (b->src_alpha>=16 && b->src_alpha<=19) || (b->dst_alpha>=16 && b->dst_alpha<=19)))return -1;
+        blend[i].srcColorBlendFactor=draw_blend_factor(b->src_rgb);blend[i].dstColorBlendFactor=draw_blend_factor(b->dst_rgb);
+        blend[i].srcAlphaBlendFactor=draw_blend_factor(b->src_alpha);blend[i].dstAlphaBlendFactor=draw_blend_factor(b->dst_alpha);
+        if(b->eq_rgb<1 || b->eq_rgb>5 || b->eq_alpha<1 || b->eq_alpha>5 || blend[i].srcColorBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].dstColorBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].srcAlphaBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].dstAlphaBlendFactor==VK_BLEND_FACTOR_MAX_ENUM)return -1;
+        blend[i].colorBlendOp=b->eq_rgb-1;blend[i].alphaBlendOp=b->eq_alpha-1;
+    }
+    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=ncolor,.pAttachments=blend};memcpy(cb.blendConstants,d->blend_constant,16);
+    VkDynamicState dynamic[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,.dynamicStateCount=2,.pDynamicStates=dynamic};
+    VkGraphicsPipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,.pVertexInputState=&vi,.pInputAssemblyState=&ia,
+        .pViewportState=&vs,.pRasterizationState=&rs,.pMultisampleState=&ms,.pDepthStencilState=&depth,.pColorBlendState=&cb,.pDynamicState=&ds,.layout=layout,.renderPass=pass,.subpass=d->fuse_subpass};
+    int cached=compute_cache_open();
+    VkResult result=vkCreateGraphicsPipelines(v.device,cached?VK_NULL_HANDLE:compute_cache,1,&pc,NULL,pipeline);
+    if(result)LOG("Vulkan graphics pipeline result=%d",result);
+    return result ? -1 : 0;
+}
 static int draw_execute_locked(const dm_draw *d,uint64_t fuse_token) {
     // Per-draw phase clocks are diagnostics, not part of ordinary rendering.
     // Even sampling 1/32 adds hundreds of clock syscalls per game frame;
@@ -1418,44 +1465,9 @@ static int draw_execute_locked(const dm_draw *d,uint64_t fuse_token) {
         if(index_snapshot_owned)free(index_snapshot);index_snapshot=NULL;index_snapshot_owned=0;
     }
     t3=draw_time_ms(); phase="graphics pipeline";
-    VkPipelineShaderStageCreateInfo stages[2]={
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=modules[0],.pName="main"},
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=modules[1],.pName="main"}};
-    VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,.vertexBindingDescriptionCount=ns,.pVertexBindingDescriptions=streams,.vertexAttributeDescriptionCount=na,.pVertexAttributeDescriptions=attrs};
-    VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=topology};
-    VkPipelineViewportStateCreateInfo vs={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.scissorCount=1};
-    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,
-        // Keep the upstream Metal/NVN winding. The negative-height viewport
-        // below supplies Metal's clip-space Y mapping for every shader/pass.
-        .cullMode=d->cull,.frontFace=d->front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE,.lineWidth=1,
-        .depthBiasEnable=d->depth_bias,.depthBiasConstantFactor=d->bias_units,.depthBiasSlopeFactor=d->bias_factor,.depthBiasClamp=d->bias_clamp};
-    VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT,.alphaToCoverageEnable=d->alpha_to_coverage};
-    if(d->depth_compare<1 || d->depth_compare>8)goto done;
-    VkPipelineDepthStencilStateCreateInfo depth={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable=d->depth_test,.depthWriteEnable=d->depth_write,.depthCompareOp=d->depth_compare-1,.stencilTestEnable=d->stencil_test};
-    for(int i=0;i<2;i++) {
-        const dm_stencil *s=&d->stencil[i];
-        if(s->fail<1 || s->fail>8 || s->zfail<1 || s->zfail>8 || s->zpass<1 || s->zpass>8 || s->compare<1 || s->compare>8)goto done;
-        VkStencilOpState state={s->fail-1,s->zpass-1,s->zfail-1,s->compare-1,s->compare_mask,s->write_mask,s->reference};
-        if(i)depth.back=state;else depth.front=state;
-    }
-    VkPipelineColorBlendAttachmentState blend[8]={0};
-    for(unsigned i=0;i<ncolor;i++) {
-        const dm_blend *b=&d->blend[i];blend[i].colorWriteMask=b->mask;blend[i].blendEnable=b->enabled;
-        if(b->enabled && !features.dualSrcBlend && ((b->src_rgb>=16 && b->src_rgb<=19) || (b->dst_rgb>=16 && b->dst_rgb<=19) || (b->src_alpha>=16 && b->src_alpha<=19) || (b->dst_alpha>=16 && b->dst_alpha<=19)))goto done;
-        blend[i].srcColorBlendFactor=draw_blend_factor(b->src_rgb);blend[i].dstColorBlendFactor=draw_blend_factor(b->dst_rgb);
-        blend[i].srcAlphaBlendFactor=draw_blend_factor(b->src_alpha);blend[i].dstAlphaBlendFactor=draw_blend_factor(b->dst_alpha);
-        if(b->eq_rgb<1 || b->eq_rgb>5 || b->eq_alpha<1 || b->eq_alpha>5 || blend[i].srcColorBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].dstColorBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].srcAlphaBlendFactor==VK_BLEND_FACTOR_MAX_ENUM || blend[i].dstAlphaBlendFactor==VK_BLEND_FACTOR_MAX_ENUM)goto done;
-        blend[i].colorBlendOp=b->eq_rgb-1;blend[i].alphaBlendOp=b->eq_alpha-1;
-    }
-    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=ncolor,.pAttachments=blend};memcpy(cb.blendConstants,d->blend_constant,16);
-    VkDynamicState dynamic[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,.dynamicStateCount=2,.pDynamicStates=dynamic};
-    VkGraphicsPipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,.pVertexInputState=&vi,.pInputAssemblyState=&ia,
-        .pViewportState=&vs,.pRasterizationState=&rs,.pMultisampleState=&ms,.pDepthStencilState=&depth,.pColorBlendState=&cb,.pDynamicState=&ds,.layout=layout,.renderPass=pass,.subpass=d->fuse_subpass};
     if(!persistent) {
-        int cached=compute_cache_open();VkResult pr=vkCreateGraphicsPipelines(v.device,cached?VK_NULL_HANDLE:compute_cache,1,&pc,NULL,&pipeline);
-        if(pr){LOG("Vulkan graphics pipeline result=%d",pr);goto done;}compute_cache_checkpoint();
+        if(draw_pipeline_create(d,pass,layout,modules,topology,ns,streams,na,attrs,ncolor,&pipeline))goto done;
+        compute_cache_checkpoint();
         {
             graphics_cached_pipeline *entry=calloc(1,sizeof *entry);
             if(entry){entry->key=key;entry->pipeline=pipeline;entry->layout=layout;entry->vertex_locations=used_attributes;memcpy(entry->sets,sets,sizeof sets);memcpy(entry->dynamic_profiles,dynamic_profiles,sizeof dynamic_profiles);graphics_pipeline_insert(entry);persistent=1;}

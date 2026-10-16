@@ -33,6 +33,8 @@ git submodule update --init --recursive
 
 构建出的 APK 包含你在本机生成的游戏衍生内容，应留在本机，不应上传为公开 Release。更新应用使用覆盖安装，避免卸载造成资源或存档丢失。
 
+已参与开发测试的用户可通过仅管理者可见的草稿 Release 接收个人测试包；覆盖安装、资源路径和首次 Vulkan 准备说明见 [INSTALL_PREVIEW.md](docs/INSTALL_PREVIEW.md)。草稿附件不是公开分发内容。
+
 ## 目录
 
 ```text

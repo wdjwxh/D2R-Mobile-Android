@@ -76,3 +76,13 @@ int dm_vk_attachment_boundary(void);
 int dm_vk_prepare_window(void);
 
 int dm_vk_draw_batch(int enabled);
+
+/* Startup worker only, after the native window exists and before guest launch.
+ * root is DM_ROOT; manifest is pso_manifest.tsv. Callback executes synchronously
+ * on the caller thread outside backend lock. It must only post UI updates.
+ * Ordinary Metal seeds warm representative Vulkan states, not every runtime
+ * variant; unsupported merged/fused records are counted as skipped.
+ * 0 ready/cache hit; 1 partial success (no completion stamp, lazy fallback may
+ * continue); -1 missing inputs/device or no compiled pipelines. */
+typedef void (*dm_vk_prepare_progress)(void *ctx,unsigned done,unsigned total,const char *phase);
+int dm_vk_prepare_shaders(const char *root,const char *manifest,dm_vk_prepare_progress cb,void *ctx);
