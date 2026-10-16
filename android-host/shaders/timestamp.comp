@@ -1,0 +1,51 @@
+// Exact float32 timestamp period conversion using only 32-bit integers.
+// Host proves the masked maximum result fits uint64 before selecting this path.
+// Binding 0: raw u64 at byte 0, output {ticks,ticks} at byte 16, range >= 32.
+#version 450
+layout(local_size_x=1,local_size_y=1,local_size_z=1) in;
+layout(set=0,binding=0,std430) buffer Timestamp { uint words[]; } data;
+layout(push_constant) uniform Parameters {
+    uint validBits; uint multiplier; uint shift; uint left;
+} params;
+uvec3 shift96(uvec3 value,uint shift,bool left) {
+    if(shift>=96u)return uvec3(0);
+    int whole=int(shift/32u);uint part=shift%32u;
+    uvec3 result=uvec3(0);
+    for(int i=0;i<3;i++) {
+        int source=left?i-whole:i+whole;
+        if(source>=0 && source<3) {
+            result[i]=left?value[source]<<part:value[source]>>part;
+            if(part!=0u) {
+                int adjacent=left?source-1:source+1;
+                if(adjacent>=0 && adjacent<3)
+                    result[i]|=left?value[adjacent]>>(32u-part):value[adjacent]<<(32u-part);
+            }
+        }
+    }
+    return result;
+}
+void main() {
+    if(any(notEqual(gl_GlobalInvocationID,uvec3(0))) || data.words.length()<8)return;
+    uint lo=data.words[0],hi=data.words[1],bits=min(params.validBits,64u);
+    if(bits==0u){lo=0u;hi=0u;}
+    else if(bits<32u){lo&=(1u<<bits)-1u;hi=0u;}
+    else if(bits==32u)hi=0u;
+    else if(bits<64u)hi&=(1u<<(bits-32u))-1u;
+    uint carry,low,high,middle;
+    umulExtended(lo,params.multiplier,carry,low);
+    umulExtended(hi,params.multiplier,high,middle);
+    uint sum=middle+carry;high+=uint(sum<middle);
+    uvec3 numerator=uvec3(low,sum,high);
+    if(params.left!=0u)numerator=shift96(numerator,params.shift,true);
+    // Binary long division: remainder always stays below 625.
+    uvec3 quotient=uvec3(0);uint remainder=0u;
+    for(int bit=95;bit>=0;--bit) {
+        int word=bit/32;uint subbit=uint(bit%32);
+        remainder=remainder*2u+((numerator[word]>>subbit)&1u);
+        if(remainder>=625u){remainder-=625u;quotient[word]|=1u<<subbit;}
+    }
+    // floor(floor(N/625)/2^k) == floor(N/(625*2^k)).
+    if(params.left==0u)quotient=shift96(quotient,params.shift,false);
+    data.words[4]=quotient.x;data.words[5]=quotient.y;
+    data.words[6]=quotient.x;data.words[7]=quotient.y;
+}

@@ -1,0 +1,24 @@
+// Equivalent to upstream nvn_builtin.h's four Maxwell counter kernels.
+// 64-bit arithmetic is expressed as pairs to keep shaderInt64 optional.
+#version 450
+layout(local_size_x=32) in;
+layout(set=0,binding=0,std430) readonly buffer Count { uint n[]; } count;
+layout(set=0,binding=1,std430) readonly buffer Source { uvec2 words[]; } src;
+layout(set=0,binding=2,std430) writeonly buffer Dest { uvec2 words[]; } dst;
+void main() {
+    uint id=gl_GlobalInvocationID.x;
+    if(count.n.length()==0)return;
+    if(id>=count.n[0])return;
+#if KERNEL < 2
+    // Check descriptor capacities on the GPU before every indexed load. The
+    // counter itself can be written by preceding GPU work, so validating it
+    // with a CPU read would serialize the command stream.
+    if(id>=uint(dst.words.length()) || id>=uint(src.words.length())/2u)return;
+    dst.words[id]=src.words[(id<<1)+uint(KERNEL)];
+#else
+    if(id>=uint(dst.words.length()) || id>=uint(src.words.length())/4u)return;
+    uint b=(id<<2)+uint(KERNEL-2);
+    uvec2 a=src.words[b+2], c=src.words[b];
+    dst.words[id]=uvec2(a.x-c.x,a.y-c.y-uint(a.x<c.x));
+#endif
+}

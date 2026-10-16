@@ -1,0 +1,3 @@
+[submodule "d2r-mobile"]
+	path = d2r-mobile
+	url = https://github.com/jhaizhou-ops/d2r-mobile.git
