@@ -1,5 +1,25 @@
 # D2R-Mobile-Android
 
+## 项目已归档：上游已正式支持 Android
+
+2026-10-23：上游 [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) 已正式提供 Android 支持及官方 APK。本项目停止独立移植开发，归档保留历史实现、构建说明和致谢。
+
+**新用户请使用上游项目：**
+
+- [上游中文说明](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/README.zh-CN.md)
+- [Android 安装与导入包说明](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/dm/android/README.zh-CN.md)
+- [官方下载（Releases）](https://github.com/jhaizhou-ops/d2r-mobile/releases)
+
+我们已使用官方 v2.0.0 APK，结合本机已有材料生成匹配的 Android 导入包，在小米 17 Max / Adreno 840 真机进入流亡者营地，显示中文界面及上游触屏布局。该结果属于官方方案，不应归为本仓库旧移植的性能成果，也不代表完整游戏或长期稳定性验收。
+
+**本地恢复和打包方案仍保留。** 归档只结束本 GitHub 仓库的日常开发；本地工作目录中的恢复脚本、打包工具、资源和存档备份不删除，仍可用于后续本地生成和准备安装材料。私人资源及生成的导入包不随本次文档更新上传。
+
+感谢 **jhaizhou、d2r-mobile 及其所有贡献者**提供完整的移植基础和官方 Android 支持。后续平台维护与更新请以上游为准。
+
+---
+
+以下为归档前的历史实现与构建说明；其中的功能状态、测量和限制描述的是旧版独立移植。
+
 基于 [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) 的《暗黑破坏神 II：狱火重生》Android ARM64 兼容层移植，图形后端使用 **Vulkan，最低 API 基线为 Vulkan 1.1**，优先适配高通 Adreno。
 
 **开发预览版。仓库不包含游戏程序、游戏资源、翻译后的游戏着色器或可直接游玩的安装包。你需要拥有正版游戏，并在本机生成这些内容。**
